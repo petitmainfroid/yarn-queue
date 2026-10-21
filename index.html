@@ -1,0 +1,1552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>织线工坊</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: #241b13; overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #wrap {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+    border-radius: 14px;
+    box-shadow: 0 10px 50px rgba(0, 0, 0, 0.65);
+  }
+</style>
+<link rel="icon" href="data:,"></head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+(function () {
+  'use strict';
+
+  /* =========================================================================
+     织线工坊 —— 单文件 Canvas 2D 休闲解谜
+     逻辑分辨率 768 x 1376（竖屏），所有美术由代码绘制。
+     ========================================================================= */
+
+  const W = 768;
+  const H = 1376;
+
+  const FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Heiti SC","Noto Sans CJK SC",sans-serif';
+
+  /* ------------------------------ 颜色定义 ------------------------------ */
+  const COLORS = {
+    R: { name: '红', hex: '#d24a42', light: '#f4867a', dark: '#8f2620', ink: '#6d1a15', tint: '#f7ddd6' },
+    B: { name: '蓝', hex: '#3d7bc9', light: '#7fb0ef', dark: '#265087', ink: '#1c3d68', tint: '#d7e6f9' },
+    G: { name: '绿', hex: '#3d9c62', light: '#7ad39c', dark: '#22683f', ink: '#17492c', tint: '#d5eede' }
+  };
+  const SPOOL_ORDER = ['R', 'B', 'G'];
+
+  /* ------------------------------ 关卡数据 ------------------------------ */
+  // grid 中每个字符是一根针脚的颜色；线轴次数在开局按“同色正交连通块数”推导，
+  // 保证每根线轴恰好对应一段线股，游戏永远可解。
+  const LEVELS = [
+    {
+      name: '第一关 · 素色方巾',
+      subtitle: '4×4 · 节拍 2.0 秒',
+      tempo: 2.0,
+      grid: [
+        'RRBG',
+        'RBBG',
+        'BBRG',
+        'GGRR'
+      ]
+    },
+    {
+      name: '第二关 · 菱纹围巾',
+      subtitle: '5×5 · 节拍 1.8 秒',
+      tempo: 1.8,
+      grid: [
+        'RRBGG',
+        'RBBGR',
+        'GBRRR',
+        'GGBBR',
+        'BGGRB'
+      ]
+    },
+    {
+      name: '第三关 · 花砖披肩',
+      subtitle: '6×6 · 节拍 1.6 秒',
+      tempo: 1.6,
+      grid: [
+        'RRBBGG',
+        'RGGBGR',
+        'BGRRBB',
+        'BBRGRG',
+        'GRGRRB',
+        'GGBBRR'
+      ]
+    }
+  ];
+
+  /* ------------------------------ 布局常量 ------------------------------ */
+  const LAYOUT = {
+    hud:    { x: 20, y: 20, w: 728, h: 186 },
+    reset:  { x: 604, y: 44, w: 120, h: 94 },
+    board:  { x: 190, y: 222, size: 554 },
+    spools: { x: 24, y: 222, w: 148, h: 180, gap: 7 },
+    tray:   { x0: 24, y: 828, slotW: 216, gap: 36, h: 236 },
+    hint:   { x: 20, y: 1092, w: 728, h: 92 },
+    footer: { x: 20, y: 1208, w: 728, h: 148 }
+  };
+
+  /* ------------------------------ 状态对象 ------------------------------ */
+  // 注意：window.__DBG 直接指向这个对象，因此所有重置都必须是“原地改写字段”，
+  // 不能整体替换 state 引用。
+  const state = {
+    level: 1,
+    levelName: LEVELS[0].name,
+    size: 4,
+    tempo: 2.0,
+    board: [],           // 二维数组，元素为 {color, locked} 或 null（已清空）
+    remaining: 0,        // 布面上尚未消化的针脚数
+    total: 0,            // 本关总针脚数
+    queue: [],           // {color, count, cells, progress, age, id}
+    spools: { R: 0, B: 0, G: 0 },
+    score: 0,
+    status: 'playing',   // playing | won | lost
+    overlay: null,       // null | 'win' | 'lose'
+    loseKind: '',
+    loseReason: '',
+    loseDetail: '',
+    time: 0,
+    ballSeq: 0,
+    message: '',
+    messageTimer: 0,
+    maxUnlocked: 3
+  };
+
+  /* ------------------------------ 视觉临时量 ------------------------------ */
+  let animT = 0;
+  let shakeT = 0;
+  let shakeColor = null;
+  const fx = [];         // 通用特效：streak / clear / score / burst
+
+  /* ------------------------------ 画布初始化 ------------------------------ */
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  function resizeCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+    canvas.style.width = Math.floor(W * scale) + 'px';
+    canvas.style.height = Math.floor(H * scale) + 'px';
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  /* ------------------------------ 通用绘图工具 ------------------------------ */
+  function roundRectPath(c, x, y, w, h, r) {
+    const rr = Math.min(r, w / 2, h / 2);
+    c.beginPath();
+    c.moveTo(x + rr, y);
+    c.arcTo(x + w, y, x + w, y + h, rr);
+    c.arcTo(x + w, y + h, x, y + h, rr);
+    c.arcTo(x, y + h, x, y, rr);
+    c.arcTo(x, y, x + w, y, rr);
+    c.closePath();
+  }
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  function easeOutBack(t) {
+    const c1 = 1.70158;
+    const c3 = c1 + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+  }
+
+  function hit(x, y, r) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  }
+
+  function wrapText(text, cx, y, maxW, lineH) {
+    const chars = Array.from(text);
+    let line = '';
+    const lines = [];
+    for (const ch of chars) {
+      const test = line + ch;
+      if (ctx.measureText(test).width > maxW && line) {
+        lines.push(line);
+        line = ch;
+      } else {
+        line = test;
+      }
+    }
+    if (line) lines.push(line);
+    for (let i = 0; i < lines.length; i++) {
+      ctx.fillText(lines[i], cx, y + i * lineH);
+    }
+    return lines.length;
+  }
+
+  /* =========================================================================
+     核心逻辑
+     ========================================================================= */
+
+  // 找出某颜色当前所有“未锁定”的正交连通块
+  function computeGroups(board, color) {
+    const n = board.length;
+    const seen = new Set();
+    const groups = [];
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const cell = board[y][x];
+        if (!cell || cell.color !== color || cell.locked) continue;
+        const key = y * n + x;
+        if (seen.has(key)) continue;
+        const stack = [[x, y]];
+        seen.add(key);
+        const cells = [];
+        while (stack.length) {
+          const cur = stack.pop();
+          const cx = cur[0];
+          const cy = cur[1];
+          cells.push([cx, cy]);
+          const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+          for (let d = 0; d < dirs.length; d++) {
+            const nx = cx + dirs[d][0];
+            const ny = cy + dirs[d][1];
+            if (nx < 0 || ny < 0 || nx >= n || ny >= n) continue;
+            const nb = board[ny][nx];
+            if (!nb || nb.color !== color || nb.locked) continue;
+            const k = ny * n + nx;
+            if (seen.has(k)) continue;
+            seen.add(k);
+            stack.push([nx, ny]);
+          }
+        }
+        groups.push(cells);
+      }
+    }
+    return groups;
+  }
+
+  // 组的阅读顺序锚点：最上，再最左
+  function groupAnchor(cells) {
+    let best = cells[0];
+    for (let i = 1; i < cells.length; i++) {
+      const c = cells[i];
+      if (c[1] < best[1] || (c[1] === best[1] && c[0] < best[0])) best = c;
+    }
+    return best;
+  }
+
+  // 选组：先取最大，同大取阅读顺序靠前
+  function pickGroup(groups) {
+    if (!groups.length) return null;
+    const copy = groups.slice();
+    copy.sort(function (a, b) {
+      if (b.length !== a.length) return b.length - a.length;
+      const an = groupAnchor(a);
+      const bn = groupAnchor(b);
+      if (an[1] !== bn[1]) return an[1] - bn[1];
+      return an[0] - bn[0];
+    });
+    return copy[0];
+  }
+
+  function loadLevel(n) {
+    const idx = clamp(Math.floor(n), 1, LEVELS.length) - 1;
+    const lv = LEVELS[idx];
+
+    state.level = idx + 1;
+    state.levelName = lv.name;
+    state.size = lv.grid.length;
+    state.tempo = lv.tempo;
+    state.board = lv.grid.map(function (row) {
+      return row.split('').map(function (ch) {
+        return { color: ch, locked: false };
+      });
+    });
+
+    let total = 0;
+    for (let y = 0; y < state.size; y++) {
+      for (let x = 0; x < state.size; x++) {
+        if (state.board[y][x]) total++;
+      }
+    }
+    state.total = total;
+    state.remaining = total;
+    state.queue = [];
+    state.score = 0;
+    state.time = 0;
+    state.status = 'playing';
+    state.overlay = null;
+    state.loseKind = '';
+    state.loseReason = '';
+    state.loseDetail = '';
+    state.ballSeq = 0;
+    state.message = '';
+    state.messageTimer = 0;
+
+    // 线轴次数 = 该色初始连通块数（保证恰好够用）
+    const spools = { R: 0, B: 0, G: 0 };
+    for (let i = 0; i < SPOOL_ORDER.length; i++) {
+      const col = SPOOL_ORDER[i];
+      spools[col] = computeGroups(state.board, col).length;
+    }
+    state.spools = spools;
+
+    fx.length = 0;
+    shakeT = 0;
+    shakeColor = null;
+  }
+
+  function pulseMessage(text, dur) {
+    state.message = text;
+    state.messageTimer = dur || 1.6;
+  }
+
+  function lose(kind, color) {
+    if (state.status !== 'playing') return;
+    state.status = 'lost';
+    state.overlay = 'lose';
+    state.loseKind = kind;
+    if (kind === 'queue-full') {
+      state.loseReason = '加工队列第 3 格已满';
+      state.loseDetail = '第 3 颗线球落进托盘，工坊卡线了。等队首的进度环走满、球被消化之后再点下一轴线。';
+    } else {
+      const cn = color ? COLORS[color].name : '';
+      state.loseReason = '线轴线头已用尽';
+      state.loseDetail = cn + '色线轴已经用完，布面上却还剩同色针脚，再也拆不下来了。';
+    }
+  }
+
+  function checkSpoolExhaustion() {
+    if (state.status !== 'playing') return;
+    for (let i = 0; i < SPOOL_ORDER.length; i++) {
+      const col = SPOOL_ORDER[i];
+      if (state.spools[col] <= 0 && computeGroups(state.board, col).length > 0) {
+        lose('spool-empty', col);
+        return;
+      }
+    }
+  }
+
+  function checkWin() {
+    if (state.status !== 'playing') return;
+    if (state.remaining === 0 && state.queue.length === 0) {
+      state.status = 'won';
+      state.overlay = 'win';
+      if (state.level < LEVELS.length) {
+        state.maxUnlocked = Math.max(state.maxUnlocked, state.level + 1);
+      }
+    }
+  }
+
+  // 点击线轴：立即结算逻辑，动画只做视觉层
+  function clickSpool(color) {
+    if (state.status !== 'playing') return { ok: false, type: 'input', reason: 'not-playing' };
+
+    const groups = computeGroups(state.board, color);
+    const left = state.spools[color] || 0;
+
+    if (left <= 0) {
+      if (groups.length > 0) {
+        lose('spool-empty', color);
+        return { ok: false, type: 'rule', reason: 'spool-empty-lose' };
+      }
+      pulseMessage(COLORS[color].name + '色线轴已空，布面也没有同色针脚');
+      shakeT = 0.32;
+      shakeColor = color;
+      return { ok: false, type: 'rule', reason: 'spool-empty' };
+    }
+
+    if (groups.length === 0) {
+      pulseMessage(COLORS[color].name + '色暂无线头可拆');
+      shakeT = 0.32;
+      shakeColor = color;
+      return { ok: false, type: 'rule', reason: 'no-thread' };
+    }
+
+    const group = pickGroup(groups);
+    for (let i = 0; i < group.length; i++) {
+      const gx = group[i][0];
+      const gy = group[i][1];
+      state.board[gy][gx].locked = true;
+    }
+    state.spools[color] -= 1;
+
+    const cellList = group.map(function (c) { return [c[0], c[1]]; });
+    const ball = {
+      color: color,
+      count: group.length,
+      cells: cellList,
+      progress: 0,
+      age: 0,
+      id: ++state.ballSeq
+    };
+    state.queue.push(ball);
+
+    // 视觉：从线轴卡飞向队尾槽位的弧光
+    const spoolIndex = SPOOL_ORDER.indexOf(color);
+    const sr = spoolRect(spoolIndex);
+    const slotIndex = state.queue.length - 1;
+    const slot = traySlotRect(clamp(slotIndex, 0, 2));
+    fx.push({
+      kind: 'streak',
+      x0: sr.x + sr.w / 2,
+      y0: sr.y + sr.h * 0.45,
+      x1: slot.x + slot.w / 2,
+      y1: slot.y + slot.h / 2,
+      color: color,
+      t: 0,
+      dur: 0.34
+    });
+
+    // 第 3 格被占满 → 当帧立即判负
+    if (state.queue.length >= 3) {
+      lose('queue-full');
+      return { ok: true, type: 'action', ball: ball };
+    }
+
+    checkSpoolExhaustion();
+    checkWin();
+    return { ok: true, type: 'action', ball: ball };
+  }
+
+  function digestFront() {
+    if (!state.queue.length) return;
+    const ball = state.queue.shift();
+
+    for (let i = 0; i < ball.cells.length; i++) {
+      const x = ball.cells[i][0];
+      const y = ball.cells[i][1];
+      if (state.board[y][x]) {
+        state.board[y][x] = null;
+        spawnClearFx(x, y, ball.color);
+      }
+    }
+    state.remaining -= ball.count;
+    const gain = ball.count * 10;
+    state.score += gain;
+
+    // 分数浮字出现在队首槽位上方
+    const slot = traySlotRect(0);
+    fx.push({
+      kind: 'score',
+      x: slot.x + slot.w / 2,
+      y: slot.y + slot.h * 0.34,
+      text: '+' + gain,
+      color: ball.color,
+      t: 0,
+      dur: 0.95
+    });
+
+    if (state.queue.length > 0) state.queue[0].progress = 0;
+
+    checkSpoolExhaustion();
+    checkWin();
+  }
+
+  function spawnClearFx(x, y, color) {
+    const b = LAYOUT.board;
+    const cell = b.size / state.size;
+    fx.push({
+      kind: 'clear',
+      x: b.x + (x + 0.5) * cell,
+      y: b.y + (y + 0.5) * cell,
+      size: cell,
+      color: color,
+      t: 0,
+      dur: 0.48
+    });
+  }
+
+  // 每帧逻辑推进；dt 为秒。可以一次传入大于一个节拍的时长。
+  function consumeQueue(dt) {
+    let rest = dt;
+    let guard = 0;
+    while (rest > 1e-9 && state.queue.length > 0 && state.status === 'playing' && guard++ < 128) {
+      const front = state.queue[0];
+      const need = Math.max(0, state.tempo - front.progress);
+      if (rest >= need) {
+        rest -= need;
+        digestFront();
+      } else {
+        front.progress += rest;
+        rest = 0;
+      }
+    }
+  }
+
+  /* =========================================================================
+     帧更新
+     ========================================================================= */
+
+  function step(dt) {
+    animT += dt;
+
+    if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
+    if (state.messageTimer > 0) {
+      state.messageTimer -= dt;
+      if (state.messageTimer <= 0) state.message = '';
+    }
+
+    for (let i = fx.length - 1; i >= 0; i--) {
+      fx[i].t += dt;
+      if (fx[i].t >= fx[i].dur) fx.splice(i, 1);
+    }
+
+    for (let i = 0; i < state.queue.length; i++) {
+      state.queue[i].age += dt;
+    }
+
+    if (state.status === 'playing') {
+      state.time += dt;
+      consumeQueue(dt);
+    }
+  }
+
+  /* =========================================================================
+     绘制
+     ========================================================================= */
+
+  function spoolRect(i) {
+    const s = LAYOUT.spools;
+    return { x: s.x, y: s.y + i * (s.h + s.gap), w: s.w, h: s.h };
+  }
+
+  function traySlotRect(i) {
+    const t = LAYOUT.tray;
+    return { x: t.x0 + i * (t.slotW + t.gap), y: t.y, w: t.slotW, h: t.h };
+  }
+
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#f7eeda');
+    g.addColorStop(0.5, '#efe1c6');
+    g.addColorStop(1, '#e2cda9');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // 斜向织纹
+    ctx.save();
+    ctx.globalAlpha = 0.05;
+    ctx.strokeStyle = '#8a6b45';
+    ctx.lineWidth = 2;
+    for (let i = -H; i < W; i += 28) {
+      ctx.beginPath();
+      ctx.moveTo(i, 0);
+      ctx.lineTo(i + H, H);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawStitch(cx, cy, cell, color, alpha, dashed) {
+    const c = COLORS[color];
+    const r = cell * 0.30;
+    const lw = Math.max(3, cell * 0.14);
+
+    ctx.save();
+    ctx.globalAlpha = clamp(alpha, 0, 1);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    // 落影
+    ctx.beginPath();
+    roundRectPath(ctx, cx - r + 2, cy - r + 4, r * 2, r * 2, r * 0.62);
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = 'rgba(96,64,32,0.22)';
+    ctx.stroke();
+
+    // 主线圈
+    ctx.beginPath();
+    roundRectPath(ctx, cx - r, cy - r, r * 2, r * 2, r * 0.62);
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = c.hex;
+    if (dashed) ctx.setLineDash([cell * 0.14, cell * 0.1]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 丝光
+    ctx.beginPath();
+    roundRectPath(ctx, cx - r - lw * 0.26, cy - r - lw * 0.28, r * 2, r * 2, r * 0.62);
+    ctx.lineWidth = lw * 0.32;
+    ctx.strokeStyle = c.light;
+    ctx.stroke();
+
+    // 针法纹样：红=斜杠 / 蓝=圆点 / 绿=交叉
+    ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.lineWidth = Math.max(2, cell * 0.07);
+    if (color === 'R') {
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.46, cy + r * 0.46);
+      ctx.lineTo(cx + r * 0.46, cy - r * 0.46);
+      ctx.stroke();
+    } else if (color === 'B') {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * 0.27, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.42, cy - r * 0.42);
+      ctx.lineTo(cx + r * 0.42, cy + r * 0.42);
+      ctx.moveTo(cx + r * 0.42, cy - r * 0.42);
+      ctx.lineTo(cx - r * 0.42, cy + r * 0.42);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawHole(cx, cy, r) {
+    ctx.save();
+    const g = ctx.createRadialGradient(cx, cy - r * 0.35, r * 0.1, cx, cy, r * 1.2);
+    g.addColorStop(0, '#c3ad8c');
+    g.addColorStop(1, '#e3d2b2');
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, r, r * 0.76, 0, 0, Math.PI * 2);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(150,120,85,0.45)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBoard() {
+    const b = LAYOUT.board;
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(96,64,32,0.32)';
+    ctx.shadowBlur = 24;
+    ctx.shadowOffsetY = 10;
+    roundRectPath(ctx, b.x, b.y, b.size, b.size, 26);
+    ctx.fillStyle = '#f3e7d0';
+    ctx.fill();
+    ctx.restore();
+
+    // 布面经纬纹
+    ctx.save();
+    roundRectPath(ctx, b.x, b.y, b.size, b.size, 26);
+    ctx.clip();
+    ctx.globalAlpha = 0.055;
+    ctx.strokeStyle = '#8a6b45';
+    ctx.lineWidth = 2;
+    for (let yy = b.y; yy < b.y + b.size; yy += 10) {
+      ctx.beginPath();
+      ctx.moveTo(b.x, yy);
+      ctx.lineTo(b.x + b.size, yy);
+      ctx.stroke();
+    }
+    for (let xx = b.x; xx < b.x + b.size; xx += 10) {
+      ctx.beginPath();
+      ctx.moveTo(xx, b.y);
+      ctx.lineTo(xx, b.y + b.size);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    roundRectPath(ctx, b.x, b.y, b.size, b.size, 26);
+    ctx.strokeStyle = '#cbb08a';
+    ctx.lineWidth = 6;
+    ctx.stroke();
+
+    const n = state.size;
+    const cell = b.size / n;
+
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const data = state.board[y][x];
+        const cx = b.x + (x + 0.5) * cell;
+        const cy = b.y + (y + 0.5) * cell;
+
+        if (!data) {
+          drawHole(cx, cy, cell * 0.26);
+        } else if (data.locked) {
+          // 待清：虚线 + 半透明 + 抬升
+          const c = COLORS[data.color];
+          ctx.save();
+          roundRectPath(ctx, b.x + x * cell + 5, b.y + y * cell + 5, cell - 10, cell - 10, cell * 0.2);
+          ctx.setLineDash([cell * 0.15, cell * 0.11]);
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = c.light;
+          ctx.stroke();
+          ctx.restore();
+          drawStitch(cx, cy - 4, cell * 0.9, data.color, 0.42, false);
+        } else {
+          drawStitch(cx, cy, cell, data.color, 1, false);
+        }
+      }
+    }
+  }
+
+  function drawBobbin(cx, topY, botY, color, dead) {
+    const c = COLORS[color];
+    const halfW = 26;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(cx - halfW, topY, halfW * 2, botY - topY);
+    ctx.clip();
+    ctx.fillStyle = dead ? '#b6a996' : c.dark;
+    ctx.fillRect(cx - halfW, topY, halfW * 2, botY - topY);
+    for (let yy = topY - 12; yy < botY + 12; yy += 8) {
+      ctx.beginPath();
+      ctx.moveTo(cx - halfW, yy);
+      ctx.lineTo(cx + halfW, yy + 7);
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = dead
+        ? '#c6b9a6'
+        : ((Math.round(yy) % 16 === 0) ? c.hex : c.light);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    const wood = dead ? '#b8a894' : '#c99f66';
+    const woodDark = dead ? '#8f8272' : '#8a6234';
+
+    ctx.beginPath();
+    ctx.ellipse(cx, topY, halfW + 8, 10, 0, 0, Math.PI * 2);
+    ctx.fillStyle = wood;
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = woodDark;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.ellipse(cx, botY, halfW + 8, 10, 0, 0, Math.PI * 2);
+    ctx.fillStyle = wood;
+    ctx.fill();
+    ctx.stroke();
+
+    if (dead) {
+      // 打结示意
+      ctx.beginPath();
+      ctx.arc(cx, (topY + botY) / 2, 9, 0, Math.PI * 2);
+      ctx.strokeStyle = '#8d8272';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+  }
+
+  function drawSpoolCard(i, color) {
+    const r = spoolRect(i);
+    const c = COLORS[color];
+    const left = state.spools[color] || 0;
+    const groups = computeGroups(state.board, color);
+    let maxGroup = 0;
+    for (let k = 0; k < groups.length; k++) maxGroup = Math.max(maxGroup, groups[k].length);
+    const dead = left <= 0;
+
+    ctx.save();
+    if (shakeT > 0 && shakeColor === color) {
+      const k = shakeT / 0.32;
+      ctx.translate(Math.sin(shakeT * 70) * 10 * k, 0);
+    }
+
+    roundRectPath(ctx, r.x, r.y, r.w, r.h, 20);
+    const g = ctx.createLinearGradient(r.x, r.y, r.x, r.y + r.h);
+    if (dead) {
+      g.addColorStop(0, '#e0d6c8');
+      g.addColorStop(1, '#cbbfad');
+    } else {
+      g.addColorStop(0, '#fdf4e3');
+      g.addColorStop(1, '#f1dfc0');
+    }
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = dead ? '#b3a795' : '#dcc39c';
+    ctx.stroke();
+
+    // 顶部色带
+    ctx.save();
+    roundRectPath(ctx, r.x, r.y, r.w, r.h, 20);
+    ctx.clip();
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = dead ? '#b7ab99' : c.hex;
+    ctx.fillRect(r.x, r.y, r.w, 9);
+    ctx.restore();
+
+    const cx = r.x + r.w / 2;
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 27px ' + FONT;
+    ctx.fillStyle = dead ? '#8d8272' : c.ink;
+    ctx.fillText(c.name, cx, r.y + 32);
+
+    drawBobbin(cx, r.y + 50, r.y + 118, color, dead);
+
+    ctx.font = 'bold 25px ' + FONT;
+    ctx.fillStyle = dead ? '#93887a' : (left <= 1 ? '#c0392b' : '#5b3d24');
+    ctx.fillText(dead ? '空' : '剩 ' + left + ' 次', cx, r.y + 140);
+
+    ctx.font = '17px ' + FONT;
+    ctx.fillStyle = '#9a7c58';
+    ctx.fillText(maxGroup > 0 ? ('最大线股 ' + maxGroup + ' 针') : '无同色针脚', cx, r.y + 166);
+
+    ctx.restore();
+  }
+
+  function drawSpools() {
+    for (let i = 0; i < SPOOL_ORDER.length; i++) {
+      drawSpoolCard(i, SPOOL_ORDER[i]);
+    }
+  }
+
+  function drawBall(cx, cy, r, color, count, age) {
+    const c = COLORS[color];
+    const pop = clamp((age || 0) / 0.22, 0, 1);
+    const s = 0.62 + 0.38 * easeOutBack(pop);
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(s, s);
+
+    // 落影
+    ctx.beginPath();
+    ctx.ellipse(0, r * 0.96, r * 0.86, r * 0.26, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(96,64,32,0.2)';
+    ctx.fill();
+
+    // 球体
+    const g = ctx.createRadialGradient(-r * 0.35, -r * 0.42, r * 0.08, 0, 0, r * 1.2);
+    g.addColorStop(0, c.light);
+    g.addColorStop(0.55, c.hex);
+    g.addColorStop(1, c.dark);
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = c.dark;
+    ctx.stroke();
+
+    // 缠绕弧线
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, r - 1, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = Math.max(2, r * 0.07);
+    for (let k = -2; k <= 2; k++) {
+      ctx.beginPath();
+      ctx.ellipse(0, 0, r * 0.95, r * 0.34, k * 0.62 + 0.42, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // 色名
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold ' + Math.round(r * 0.32) + 'px ' + FONT;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillText(c.name, 0, -r * 0.72);
+
+    // 中央标牌 + 针数
+    ctx.beginPath();
+    ctx.arc(0, r * 0.16, r * 0.46, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,252,244,0.95)';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = c.dark;
+    ctx.stroke();
+
+    ctx.fillStyle = c.ink;
+    ctx.font = 'bold ' + Math.round(r * 0.6) + 'px ' + FONT;
+    ctx.fillText(String(count), 0, r * 0.16 + r * 0.02);
+
+    ctx.restore();
+  }
+
+  function drawQueueSlot(i) {
+    const t = LAYOUT.tray;
+    const r = traySlotRect(i);
+    const danger = (i === 2);
+    const ball = state.queue[i];
+    const pulse = 0.5 + 0.5 * Math.sin(animT * 8);
+
+    // 托盘凹槽
+    roundRectPath(ctx, r.x, r.y, r.w, r.h, 24);
+    const g = ctx.createLinearGradient(r.x, r.y, r.x, r.y + r.h);
+    if (danger) {
+      g.addColorStop(0, '#f3d8cf');
+      g.addColorStop(1, '#e7bfb2');
+    } else {
+      g.addColorStop(0, '#e9d6b6');
+      g.addColorStop(1, '#dcc39c');
+    }
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = danger ? '#d09a89' : '#c6a97f';
+    ctx.stroke();
+
+    // 危险斜纹
+    if (danger) {
+      ctx.save();
+      roundRectPath(ctx, r.x, r.y, r.w, r.h, 24);
+      ctx.clip();
+      ctx.globalAlpha = 0.18 + 0.14 * (state.queue.length === 2 ? pulse : 0);
+      ctx.strokeStyle = '#c0392b';
+      ctx.lineWidth = 12;
+      for (let k = -r.h; k < r.w + r.h; k += 34) {
+        ctx.beginPath();
+        ctx.moveTo(r.x + k, r.y + r.h);
+        ctx.lineTo(r.x + k + r.h, r.y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    const cx = r.x + r.w / 2;
+    const cy = r.y + r.h / 2;
+
+    if (ball) {
+      drawBall(cx, cy, Math.min(r.w, r.h) * 0.31, ball.color, ball.count, ball.age);
+      if (i === 0 && state.status === 'playing') {
+        const p = clamp(ball.progress / state.tempo, 0, 1);
+        const rr = Math.min(r.w, r.h) * 0.31 + 14;
+        ctx.beginPath();
+        ctx.arc(cx, cy, rr, 0, Math.PI * 2);
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = 'rgba(120,90,50,0.18)';
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(cx, cy, rr, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * p);
+        ctx.lineWidth = 8;
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = '#e0a53a';
+        ctx.stroke();
+        ctx.lineCap = 'butt';
+      }
+    } else {
+      const rr = Math.min(r.w, r.h) * 0.28;
+      ctx.save();
+      ctx.setLineDash([12, 10]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, rr, 0, Math.PI * 2);
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = danger ? 'rgba(180,80,60,0.5)' : 'rgba(150,120,80,0.4)';
+      ctx.stroke();
+      ctx.restore();
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '22px ' + FONT;
+      ctx.fillStyle = danger ? 'rgba(170,80,60,0.8)' : 'rgba(150,120,80,0.65)';
+      ctx.fillText('空', cx, cy);
+    }
+
+    // 槽位序号
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = 'bold 18px ' + FONT;
+    ctx.fillStyle = danger ? 'rgba(160,70,50,0.85)' : 'rgba(140,110,70,0.75)';
+    ctx.fillText(String(i + 1), r.x + 14, r.y + 28);
+
+    if (danger) {
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.font = 'bold 22px ' + FONT;
+      ctx.fillStyle = 'rgba(170,60,40,' + (0.65 + 0.35 * (state.queue.length === 2 ? pulse : 0)) + ')';
+      ctx.fillText('危 险', cx, r.y + r.h - 16);
+    }
+  }
+
+  function drawTray() {
+    const t = LAYOUT.tray;
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = 'bold 24px ' + FONT;
+    ctx.fillStyle = '#6b4a2a';
+    ctx.fillText('加工队列', t.x0 + 4, t.y - 18);
+
+    ctx.textAlign = 'right';
+    ctx.font = '20px ' + FONT;
+    ctx.fillStyle = '#8a6a45';
+    const eta = state.queue.length > 0
+      ? ('队首还需 ' + Math.max(0, state.tempo - state.queue[0].progress).toFixed(1) + ' 秒')
+      : ('每 ' + state.tempo.toFixed(1) + ' 秒消化 1 颗');
+    ctx.fillText(eta, t.x0 + 3 * t.slotW + 2 * t.gap, t.y - 18);
+
+    for (let i = 0; i < 3; i++) drawQueueSlot(i);
+  }
+
+  function drawHud() {
+    const hud = LAYOUT.hud;
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(96,64,32,0.24)';
+    ctx.shadowBlur = 18;
+    ctx.shadowOffsetY = 6;
+    roundRectPath(ctx, hud.x, hud.y, hud.w, hud.h, 26);
+    ctx.fillStyle = '#fdf6e8';
+    ctx.fill();
+    ctx.restore();
+
+    roundRectPath(ctx, hud.x, hud.y, hud.w, hud.h, 26);
+    ctx.strokeStyle = '#d9c3a0';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // 标题
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = 'bold 33px ' + FONT;
+    ctx.fillStyle = '#5b3d24';
+    ctx.fillText(state.levelName, hud.x + 28, hud.y + 60);
+
+    // 数据行
+    const qLen = state.queue.length;
+    drawStat(hud.x + 28, hud.y + 116, '剩余', state.remaining + ' / ' + state.total, '#5b3d24');
+    drawStat(hud.x + 214, hud.y + 116, '队列', qLen + ' / 3', qLen >= 2 ? '#c0392b' : '#5b3d24');
+    drawStat(hud.x + 380, hud.y + 116, '得分', String(state.score), '#5b3d24');
+
+    // 节拍说明
+    ctx.textAlign = 'left';
+    ctx.font = '18px ' + FONT;
+    ctx.fillStyle = '#9a7c58';
+    ctx.fillText('节拍 ' + state.tempo.toFixed(1) + ' 秒/颗 · 单球得分 = 针数 × 10', hud.x + 28, hud.y + 164);
+
+    // 重置按钮
+    const rb = LAYOUT.reset;
+    roundRectPath(ctx, rb.x, rb.y, rb.w, rb.h, 20);
+    const rg = ctx.createLinearGradient(rb.x, rb.y, rb.x, rb.y + rb.h);
+    rg.addColorStop(0, '#f6e3c2');
+    rg.addColorStop(1, '#e4c79c');
+    ctx.fillStyle = rg;
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#c9a877';
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 26px ' + FONT;
+    ctx.fillStyle = '#6b4a2a';
+    ctx.fillText('重置', rb.x + rb.w / 2, rb.y + 40);
+    ctx.font = '17px ' + FONT;
+    ctx.fillStyle = '#9a7c58';
+    ctx.fillText('R 键', rb.x + rb.w / 2, rb.y + 70);
+  }
+
+  function drawStat(x, y, label, value, valueColor) {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = '22px ' + FONT;
+    ctx.fillStyle = '#9a7c58';
+    ctx.fillText(label, x, y);
+    const lw = ctx.measureText(label).width;
+    ctx.font = 'bold 27px ' + FONT;
+    ctx.fillStyle = valueColor;
+    ctx.fillText(value, x + lw + 10, y);
+  }
+
+  function drawHint() {
+    const h = LAYOUT.hint;
+    let text = '';
+    let urgent = false;
+
+    if (state.status === 'playing' && state.queue.length === 2) {
+      text = '再放 1 颗球就输了！等队首消化完再点线轴';
+      urgent = true;
+    } else if (state.message) {
+      text = state.message;
+      urgent = true;
+    } else if (state.status === 'playing') {
+      text = '点线轴 → 拆下同色线股 → 线球入队 → 每 ' + state.tempo.toFixed(1) + ' 秒消化 1 颗';
+    } else if (state.status === 'won') {
+      text = '布面已清空，工坊收工！';
+    } else {
+      text = state.loseReason;
+    }
+
+    roundRectPath(ctx, h.x, h.y, h.w, h.h, 22);
+    ctx.fillStyle = urgent ? '#fbe3dc' : '#f6ecd8';
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = urgent ? '#dfa292' : '#ddc9a5';
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 24px ' + FONT;
+    ctx.fillStyle = urgent ? '#b8442f' : '#7a5a36';
+    ctx.fillText(text, h.x + h.w / 2, h.y + h.h / 2);
+  }
+
+  function drawFooter() {
+    const f = LAYOUT.footer;
+
+    roundRectPath(ctx, f.x, f.y, f.w, f.h, 22);
+    ctx.fillStyle = 'rgba(253,246,232,0.8)';
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#ddc9a5';
+    ctx.stroke();
+
+    const items = [
+      { color: 'R', label: '红 · 斜针' },
+      { color: 'B', label: '蓝 · 点针' },
+      { color: 'G', label: '绿 · 叉针' }
+    ];
+    for (let i = 0; i < items.length; i++) {
+      const x = f.x + 66 + i * 232;
+      drawStitch(x, f.y + 52, 62, items[i].color, 1, false);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = '21px ' + FONT;
+      ctx.fillStyle = '#7a5a36';
+      ctx.fillText(items[i].label, x + 40, f.y + 52);
+    }
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '19px ' + FONT;
+    ctx.fillStyle = '#9a7c58';
+    ctx.fillText('键盘 1 / 2 / 3 选对应线轴 · R 重置 · 队列满 3 格立即失败', f.x + f.w / 2, f.y + 112);
+  }
+
+  function drawFx() {
+    for (let i = 0; i < fx.length; i++) {
+      const e = fx[i];
+      const p = clamp(e.t / e.dur, 0, 1);
+
+      if (e.kind === 'clear') {
+        ctx.save();
+        ctx.globalAlpha = 1 - p;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, e.size * 0.28 + p * e.size * 0.5, 0, Math.PI * 2);
+        ctx.lineWidth = 5 * (1 - p);
+        ctx.strokeStyle = COLORS[e.color].light;
+        ctx.stroke();
+        ctx.restore();
+        drawStitch(e.x, e.y, e.size * (1 - p * 0.55), e.color, 1 - p, false);
+      } else if (e.kind === 'score') {
+        ctx.save();
+        ctx.globalAlpha = 1 - p * p;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 40px ' + FONT;
+        ctx.fillStyle = COLORS[e.color].dark;
+        ctx.fillText(e.text, e.x, e.y - p * 70);
+        ctx.restore();
+      } else if (e.kind === 'streak') {
+        const mx = (e.x0 + e.x1) / 2;
+        const my = Math.min(e.y0, e.y1) - 150;
+        ctx.save();
+        ctx.globalAlpha = 0.55 * (1 - p);
+        ctx.beginPath();
+        ctx.moveTo(e.x0, e.y0);
+        ctx.quadraticCurveTo(mx, my, e.x1, e.y1);
+        ctx.lineWidth = 5;
+        ctx.strokeStyle = COLORS[e.color].light;
+        ctx.stroke();
+        ctx.restore();
+
+        // 沿线飞行的光点
+        const q = easeOutBack(clamp(p * 1.05, 0, 1));
+        const bx = (1 - q) * (1 - q) * e.x0 + 2 * (1 - q) * q * mx + q * q * e.x1;
+        const by = (1 - q) * (1 - q) * e.y0 + 2 * (1 - q) * q * my + q * q * e.y1;
+        ctx.save();
+        ctx.globalAlpha = 1 - p * 0.6;
+        ctx.beginPath();
+        ctx.arc(bx, by, 13, 0, Math.PI * 2);
+        ctx.fillStyle = COLORS[e.color].light;
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#fff8ea';
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
+  /* ------------------------------ 结算层 ------------------------------ */
+
+  function overlayLayout() {
+    const pw = 620;
+    const ph = 660;
+    const px = (W - pw) / 2;
+    const py = (H - ph) / 2 - 20;
+    const buttons = [];
+
+    if (state.status === 'lost') {
+      buttons.push({
+        id: 'retry', label: '重试本关',
+        x: px + 90, y: py + ph - 172, w: pw - 180, h: 104, primary: true
+      });
+    } else if (state.status === 'won') {
+      if (state.level < LEVELS.length) {
+        buttons.push({
+          id: 'next', label: '进入下一关',
+          x: px + 90, y: py + ph - 272, w: pw - 180, h: 104, primary: true
+        });
+        buttons.push({
+          id: 'retry', label: '重玩本关',
+          x: px + 90, y: py + ph - 150, w: pw - 180, h: 88, primary: false
+        });
+      } else {
+        buttons.push({
+          id: 'restartAll', label: '再玩一次',
+          x: px + 90, y: py + ph - 172, w: pw - 180, h: 104, primary: true
+        });
+      }
+    }
+    return { px: px, py: py, pw: pw, ph: ph, buttons: buttons };
+  }
+
+  function drawOverlay() {
+    if (!state.overlay) return;
+    const lay = overlayLayout();
+    const px = lay.px;
+    const py = lay.py;
+    const pw = lay.pw;
+    const ph = lay.ph;
+    const won = state.status === 'won';
+    const cx = px + pw / 2;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(48,32,18,0.66)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.45)';
+    ctx.shadowBlur = 40;
+    ctx.shadowOffsetY = 14;
+    roundRectPath(ctx, px, py, pw, ph, 34);
+    ctx.fillStyle = '#fdf5e6';
+    ctx.fill();
+    ctx.restore();
+
+    roundRectPath(ctx, px, py, pw, ph, 34);
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = won ? '#e0b34e' : '#cf6a55';
+    ctx.stroke();
+
+    // 标题
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 56px ' + FONT;
+    ctx.fillStyle = won ? '#b8862a' : '#b8442f';
+    let title = '游戏结束';
+    if (won) title = (state.level >= LEVELS.length) ? '全部通关！' : '通关！';
+    ctx.fillText(title, cx, py + 92);
+
+    // 副标题
+    ctx.font = 'bold 27px ' + FONT;
+    ctx.fillStyle = '#7a5a36';
+    const sub = won
+      ? (state.level >= LEVELS.length
+          ? '三块织物全部清空，织线工坊圆满收工。'
+          : (LEVELS[state.level - 1].name + ' 已清空'))
+      : state.loseReason;
+    wrapText(sub, cx, py + 168, pw - 100, 36);
+
+    // 说明
+    ctx.font = '21px ' + FONT;
+    ctx.fillStyle = '#8a6a45';
+    const detail = won
+      ? '每颗线球按针数计分：针数 × 10。下一关布面更大、节拍更快。'
+      : state.loseDetail;
+    wrapText(detail, cx, py + 252, pw - 116, 32);
+
+    // 迷你队列图，帮助理解失败原因
+    const boxW = 96;
+    const boxGap = 20;
+    const totalW = boxW * 3 + boxGap * 2;
+    const bx0 = cx - totalW / 2;
+    const by = py + 400;
+    for (let i = 0; i < 3; i++) {
+      const bx = bx0 + i * (boxW + boxGap);
+      const danger = (i === 2);
+      roundRectPath(ctx, bx, by, boxW, boxW, 16);
+      ctx.fillStyle = danger ? '#f2d3c9' : '#ecdcc0';
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = danger ? '#cf6a55' : '#cdb693';
+      ctx.stroke();
+
+      const b = state.queue[i];
+      if (b) {
+        ctx.beginPath();
+        ctx.arc(bx + boxW / 2, by + boxW / 2, boxW * 0.3, 0, Math.PI * 2);
+        ctx.fillStyle = COLORS[b.color].hex;
+        ctx.fill();
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 26px ' + FONT;
+        ctx.fillStyle = '#fffdf5';
+        ctx.fillText(String(b.count), bx + boxW / 2, by + boxW / 2 + 1);
+      } else {
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '20px ' + FONT;
+        ctx.fillStyle = 'rgba(150,120,80,0.6)';
+        ctx.fillText('空', bx + boxW / 2, by + boxW / 2);
+      }
+    }
+    // 第 3 格红色警示框
+    if (!won) {
+      const bx = bx0 + 2 * (boxW + boxGap);
+      roundRectPath(ctx, bx - 4, by - 4, boxW + 8, boxW + 8, 20);
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = '#c0392b';
+      ctx.stroke();
+    }
+
+    // 得分
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 34px ' + FONT;
+    ctx.fillStyle = '#5b3d24';
+    ctx.fillText('本关得分 ' + state.score, cx, py + 552);
+
+    // 按钮
+    for (let i = 0; i < lay.buttons.length; i++) {
+      const b = lay.buttons[i];
+      roundRectPath(ctx, b.x, b.y, b.w, b.h, 24);
+      if (b.primary) {
+        const g = ctx.createLinearGradient(b.x, b.y, b.x, b.y + b.h);
+        if (won) {
+          g.addColorStop(0, '#f2c14e');
+          g.addColorStop(1, '#d99a2b');
+        } else {
+          g.addColorStop(0, '#e0725c');
+          g.addColorStop(1, '#c2543f');
+        }
+        ctx.fillStyle = g;
+      } else {
+        ctx.fillStyle = '#eadfc9';
+      }
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = b.primary ? 'rgba(120,80,20,0.35)' : '#cbb695';
+      ctx.stroke();
+
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 34px ' + FONT;
+      ctx.fillStyle = b.primary ? '#ffffff' : '#6b4a2a';
+      ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 2);
+    }
+
+    ctx.restore();
+  }
+
+  /* ------------------------------ 主绘制 ------------------------------ */
+
+  function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const dpr = canvas.width / W;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    ctx.clearRect(0, 0, W, H);
+    drawBackground();
+    drawHud();
+    drawSpools();
+    drawBoard();
+    drawTray();
+    drawHint();
+    drawFooter();
+    drawFx();
+    drawOverlay();
+  }
+
+  /* =========================================================================
+     输入
+     ========================================================================= */
+
+  function activateOverlayButton(id) {
+    if (id === 'retry') {
+      loadLevel(state.level);
+    } else if (id === 'next') {
+      loadLevel(Math.min(LEVELS.length, state.level + 1));
+    } else if (id === 'restartAll') {
+      loadLevel(1);
+    }
+  }
+
+  function handlePointer(x, y) {
+    // 1) 重置按钮永远可用
+    if (hit(x, y, LAYOUT.reset)) {
+      loadLevel(state.level);
+      pulseMessage('已重置本关');
+      return;
+    }
+
+    // 2) 结算层拦截其它点击
+    if (state.overlay) {
+      const lay = overlayLayout();
+      for (let i = 0; i < lay.buttons.length; i++) {
+        if (hit(x, y, lay.buttons[i])) {
+          activateOverlayButton(lay.buttons[i].id);
+          return;
+        }
+      }
+      return;
+    }
+
+    // 3) 线轴卡
+    for (let i = 0; i < SPOOL_ORDER.length; i++) {
+      if (hit(x, y, spoolRect(i))) {
+        clickSpool(SPOOL_ORDER[i]);
+        return;
+      }
+    }
+  }
+
+  function pointerToLogical(evt) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (evt.clientX - rect.left) / rect.width * W;
+    const y = (evt.clientY - rect.top) / rect.height * H;
+    return { x: x, y: y };
+  }
+
+  canvas.addEventListener('pointerdown', function (evt) {
+    evt.preventDefault();
+    const p = pointerToLogical(evt);
+    handlePointer(p.x, p.y);
+  }, { passive: false });
+
+  canvas.addEventListener('contextmenu', function (evt) { evt.preventDefault(); });
+
+  window.addEventListener('keydown', function (evt) {
+    const k = evt.key;
+    if (k === '1' || k === '2' || k === '3') {
+      evt.preventDefault();
+      if (state.overlay) return;
+      clickSpool(SPOOL_ORDER[Number(k) - 1]);
+    } else if (k === 'r' || k === 'R') {
+      evt.preventDefault();
+      loadLevel(state.level);
+      pulseMessage('已重置本关');
+    } else if (k === 'Enter' || k === ' ') {
+      if (state.overlay) {
+        evt.preventDefault();
+        const lay = overlayLayout();
+        if (lay.buttons.length) activateOverlayButton(lay.buttons[0].id);
+      }
+    }
+  });
+
+  window.addEventListener('resize', function () {
+    resizeCanvas();
+    draw();
+  });
+
+  /* =========================================================================
+     自动化接口
+     ========================================================================= */
+
+  function snapshot() {
+    return {
+      level: state.level,
+      levelName: state.levelName,
+      size: state.size,
+      tempo: state.tempo,
+      board: state.board.map(function (row) {
+        return row.map(function (c) {
+          return c ? { color: c.color, locked: c.locked } : null;
+        });
+      }),
+      remaining: state.remaining,
+      total: state.total,
+      queue: state.queue.map(function (b) {
+        return { color: b.color, count: b.count, progress: Number(b.progress.toFixed(3)) };
+      }),
+      spools: { R: state.spools.R, B: state.spools.B, G: state.spools.G },
+      score: state.score,
+      status: state.status,
+      overlay: state.overlay,
+      loseReason: state.loseReason,
+      time: Number(state.time.toFixed(3)),
+      message: state.message
+    };
+  }
+
+  Object.defineProperty(state, 'getState', {
+    value: snapshot, enumerable: false, writable: false, configurable: true
+  });
+  Object.defineProperty(state, 'startLevel', {
+    value: function (n) { loadLevel(n); draw(); }, enumerable: false, writable: false, configurable: true
+  });
+  Object.defineProperty(state, 'restart', {
+    value: function () { loadLevel(state.level); draw(); }, enumerable: false, writable: false, configurable: true
+  });
+
+  window.__DBG = state;
+
+  window.__LOOP = function (dt) {
+    if (typeof dt !== 'number' || !isFinite(dt) || dt < 0) return;
+    // 自动化接口可能一次传入多个节拍，此处不做截断，交由 consumeQueue 内部 while 处理
+    step(dt);
+    draw();
+  };
+
+  if (window.GameAgentBridge && typeof window.GameAgentBridge.register === 'function') {
+    window.GameAgentBridge.register({
+      reset: function (seed) {
+        const lv = (typeof seed === 'number' && isFinite(seed) && seed >= 1 && seed <= LEVELS.length)
+          ? Math.floor(seed) : 1;
+        loadLevel(lv);
+        draw();
+      },
+      observe: function () {
+        return {
+          level: state.level,
+          levelName: state.levelName,
+          status: state.status,
+          overlay: state.overlay,
+          remaining: state.remaining,
+          total: state.total,
+          score: state.score,
+          tempo: state.tempo,
+          queue: state.queue.map(function (b) {
+            return { color: b.color, count: b.count };
+          }),
+          queueSize: state.queue.length,
+          queueCapacity: 3,
+          spools: { R: state.spools.R, B: state.spools.B, G: state.spools.G },
+          loseReason: state.loseReason,
+          message: state.message,
+          boardColors: state.board.map(function (row) {
+            return row.map(function (c) { return c ? c.color : null; });
+          }),
+          boardLocked: state.board.map(function (row) {
+            return row.map(function (c) { return c ? c.locked : false; });
+          }),
+          time: Number(state.time.toFixed(2))
+        };
+      }
+    });
+  }
+
+  /* =========================================================================
+     启动
+     ========================================================================= */
+
+  resizeCanvas();
+  loadLevel(1);
+  draw();
+
+  let lastTime = performance.now();
+  function frame(now) {
+    let dt = (now - lastTime) / 1000;
+    lastTime = now;
+    if (!(dt > 0)) dt = 0;
+    // 单帧步长上限，避免切后台回来后一次跳过太多节拍
+    if (dt > 0.06) dt = 0.06;
+    window.__LOOP(dt);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
